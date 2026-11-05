@@ -60,6 +60,7 @@ enum interface_color {
 };
 
 struct device_window {
+  WINDOW *mini_win; // Mini view: single full-width line for this GPU (NULL in the full view)
   WINDOW *name_win; // Name of the GPU
   WINDOW *gpu_util_enc_dec;
   WINDOW *gpu_util_no_enc_or_dec;
@@ -152,6 +153,7 @@ struct nvtop_interface {
   struct plot_window *plots;
   interface_ring_buffer saved_data_ring;
   struct setup_window setup_win;
+  unsigned mini_name_width; // Mini view: column width reserved for the GPU name
 };
 
 enum device_field {

@@ -69,6 +69,8 @@ static const char helpstring[] = "Available options:\n"
                                  "  -r --reverse-abs          : Reverse abscissa: plot the recent data left and "
                                  "older on the right\n"
                                  "  -C --no-color             : No colors\n"
+                                 "  -m --mini                 : Mini view: one line per GPU (name, temp, GPU and "
+                                 "memory usage bars), for small terminals\n"
                                  "line information\n"
                                  "  -f --freedom-unit         : Use fahrenheit\n"
                                  "  -i --gpu-info             : Show dynamic GPU info bar (clock domains, NVLink "
@@ -112,12 +114,13 @@ static const struct option long_opts[] = {
     {.name = "no-processes", .has_arg = no_argument, .flag = NULL, .val = 'P'},
     {.name = "dynamic-memory-units", .has_arg = no_argument, .flag = NULL, .val = 'u'},
     {.name = "reverse-abs", .has_arg = no_argument, .flag = NULL, .val = 'r'},
+    {.name = "mini", .has_arg = no_argument, .flag = NULL, .val = 'm'},
     {.name = "snapshot", .has_arg = no_argument, .flag = NULL, .val = 's'},
     {.name = "loop", .has_arg = no_argument, .flag = NULL, .val = 'l'},
     {0, 0, 0, 0},
 };
 
-static const char opts[] = "hvd:c:CfE:pPrislXu";
+static const char opts[] = "hvd:c:CfE:pPrismXul";
 
 int main(int argc, char **argv) {
   (void)setlocale(LC_CTYPE, "");
@@ -136,6 +139,7 @@ int main(int argc, char **argv) {
   bool dynamic_memory_units_option = false;
   bool show_snapshot = false;
   bool loop_snapshot = false;
+  bool mini_view_option = false;
   double encode_decode_hide_time = -1.;
   char *custom_config_file_path = NULL;
   while (true) {
@@ -201,6 +205,9 @@ int main(int argc, char **argv) {
       break;
     case 'r':
       reverse_plot_direction_option = true;
+      break;
+    case 'm':
+      mini_view_option = true;
       break;
     case 's':
       show_snapshot = true;
@@ -341,6 +348,7 @@ int main(int argc, char **argv) {
   allDevicesOptions.has_gpu_info_bar = allDevicesOptions.has_gpu_info_bar || show_gpu_info_bar;
   allDevicesOptions.has_all_info_bar = allDevicesOptions.has_all_info_bar || show_all_info_bar;
   allDevicesOptions.dynamic_memory_units = allDevicesOptions.dynamic_memory_units || dynamic_memory_units_option;
+  allDevicesOptions.mini_view = allDevicesOptions.mini_view || mini_view_option;
 
   gpuinfo_populate_static_infos(&monitoredGpus);
   unsigned numMonitoredGpus =

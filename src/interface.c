@@ -522,6 +522,16 @@ static void initialize_all_windows(struct nvtop_interface *dwin) {
 
   unsigned int devices_count = dwin->monitored_dev_count;
 
+  if (dwin->options.mini_view) {
+    // Mini view: exactly one full-width line per GPU and nothing else on screen
+    // (no header, plots, process list, shortcut bar or setup window). Designed
+    // so 8 GPUs fill an 8-row terminal perfectly.
+    for (unsigned int i = 0; i < devices_count; ++i) {
+      dwin->devices_win[i].mini_win = ((int)i < rows) ? newwin(1, cols, i, 0) : NULL;
+    }
+    return;
+  }
+
   struct window_position device_positions[devices_count];
   unsigned map_device_to_plot[devices_count];
   struct window_position process_position;
@@ -556,8 +566,15 @@ static void initialize_all_windows(struct nvtop_interface *dwin) {
 
 static void delete_all_windows(struct nvtop_interface *dwin) {
   for (unsigned int i = 0; i < dwin->monitored_dev_count; ++i) {
+    if (dwin->options.mini_view) {
+      if (dwin->devices_win[i].mini_win)
+        delwin(dwin->devices_win[i].mini_win);
+      continue;
+    }
     free_device_windows(&dwin->devices_win[i]);
   }
+  if (dwin->options.mini_view)
+    return;
   delwin(dwin->process.process_win);
   delwin(dwin->process.process_with_option_win);
   dwin->process.process_win = NULL;
@@ -632,6 +649,7 @@ struct nvtop_interface *initialize_curses(unsigned total_devices, unsigned devic
   }
 
   interface_alloc_ring_buffer(devices_count, 4, 10 * 60 * 1000, &interface->saved_data_ring);
+  interface->mini_name_width = min(largest_device_name, 20);
   initialize_all_windows(interface);
   return interface;
 }
@@ -738,6 +756,173 @@ static void draw_temp_color(WINDOW *win, unsigned int temp, unsigned int temp_sl
   else
     waddch(win, 'F');
   wnoutrefresh(win);
+}
+
+// ---------------------------------------------------------------------------
+// Mini view: one line per GPU, in the form
+//
+//   0 NVIDIA H200   42°C GPU[||||||||          |  42%] MEM[||||      |  34GiB/141GiB]
+//
+// No other statistics are drawn, so 8 GPUs fit an 8-row terminal exactly.
+// ---------------------------------------------------------------------------
+
+// Format "used/total" sharing the total's unit and precision so the string
+// width is constant across refreshes (the bar does not jitter as memory use
+// changes). The used part is right-aligned to the total's width.
+static void format_mem_pair_mini(char *buffer, size_t size, uint64_t used, uint64_t total) {
+  double tval = total, uval = used;
+  size_t unit = 0;
+  while (unit < sizeof(memory_prefix) / sizeof(*memory_prefix) - 1 && tval >= 1000.) {
+    tval /= 1024.;
+    uval /= 1024.;
+    ++unit;
+  }
+  const char *suffix = unit ? "B" : "";
+  char total_str[24];
+  char used_str[24];
+  if (unit == 0 || tval >= 100.) {
+    snprintf(total_str, sizeof(total_str), "%.0f%s%s", tval, memory_prefix[unit], suffix);
+    snprintf(used_str, sizeof(used_str), "%.0f%s%s", uval, memory_prefix[unit], suffix);
+  } else if (tval >= 10.) {
+    snprintf(total_str, sizeof(total_str), "%.1f%s%s", tval, memory_prefix[unit], suffix);
+    snprintf(used_str, sizeof(used_str), "%.1f%s%s", uval, memory_prefix[unit], suffix);
+  } else {
+    snprintf(total_str, sizeof(total_str), "%.2f%s%s", tval, memory_prefix[unit], suffix);
+    snprintf(used_str, sizeof(used_str), "%.2f%s%s", uval, memory_prefix[unit], suffix);
+  }
+  snprintf(buffer, size, "%*s/%s", (int)strlen(total_str), used_str, total_str);
+}
+
+// Draw "label[<bar><right_text>]" at (row, col); width spans label + brackets +
+// right text, with the right text right-aligned inside the bar, like the full
+// view's percentage meters. The bar fill is highlighted with bar_color.
+static void mini_draw_labeled_bar(WINDOW *win, int row, int col, int width, const char *label, unsigned percent,
+                                  const char *right_text, short bar_color) {
+  if (width <= 0)
+    return;
+  size_t label_len = strlen(label);
+  size_t right_len = strlen(right_text);
+  int content = width - (int)label_len - 2;
+  if (content < 0)
+    content = 0;
+  wmove(win, row, col);
+  wcolor_set(win, cyan_color, NULL);
+  wprintw(win, "%s", label);
+  wstandend(win);
+  waddch(win, '[');
+  int filled = (int)llround((double)content * min(percent, 100u) / 100.);
+  if (filled > content)
+    filled = content;
+  if (filled > 0)
+    whline(win, '|', filled);
+  // Right-align the text inside the bar; if it does not fit, show its tail
+  if ((size_t)content >= right_len)
+    mvwprintw(win, row, col + label_len + 1 + content - right_len, "%s", right_text);
+  else
+    mvwprintw(win, row, col + label_len + 1, "%.*s", content, right_text + (right_len - (size_t)content));
+  mvwaddch(win, row, col + label_len + 1 + content, ']');
+  if (filled > 0)
+    mvwchgat(win, row, col + label_len + 1, filled, 0, bar_color, NULL);
+}
+
+static void draw_devices_mini(struct list_head *devices, struct nvtop_interface *interface) {
+  int rows, cols;
+  getmaxyx(stdscr, rows, cols);
+  struct gpu_info *device;
+  unsigned dev_id = 0;
+
+  list_for_each_entry(device, devices, list) {
+    if ((int)dev_id >= rows)
+      break; // More GPUs than terminal rows: only the first ones fit
+    WINDOW *win = interface->devices_win[dev_id].mini_win;
+    if (!win)
+      break;
+    werase(win);
+
+    unsigned name_width = interface->mini_name_width;
+    bool celsius = !interface->options.temperature_in_fahrenheit;
+
+    // <id> <name> <temp> GPU[...]<spaces>MEM[...]
+    // Fixed-width fields first; leftover columns are split between the two bars.
+    const int gpu_text_width = 4;    // " 42%" / "100%"
+    char mem_text[48];
+    unsigned mem_percent = 0;
+    bool mem_valid = GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, total_memory) &&
+                     GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, used_memory) &&
+                     device->dynamic_info.total_memory > 0;
+    if (mem_valid) {
+      format_mem_pair_mini(mem_text, sizeof(mem_text), device->dynamic_info.used_memory,
+                           device->dynamic_info.total_memory);
+      mem_percent = (unsigned)(100. * device->dynamic_info.used_memory / device->dynamic_info.total_memory);
+    } else {
+      snprintf(mem_text, sizeof(mem_text), "N/A");
+    }
+    int mem_text_width = strlen(mem_text);
+
+    int fixed = 2 + 1 + (int)name_width + 1 + 5 + 1 + (3 + 2 + gpu_text_width) + 1 + (3 + 2 + mem_text_width);
+    int leftover = cols - fixed;
+    if (leftover < 0)
+      leftover = 0;
+    int gpu_extra = leftover / 2;
+    int mem_extra = leftover - gpu_extra;
+
+    int x = 0;
+    // Device id
+    wcolor_set(win, cyan_color, NULL);
+    mvwprintw(win, 0, x, "%2u", dev_id);
+    wstandend(win);
+    x += 2;
+    mvwaddch(win, 0, x++, ' ');
+    // Name
+    if (GPUINFO_STATIC_FIELD_VALID(&device->static_info, device_name))
+      mvwprintw(win, 0, x, "%-*.*s", name_width, name_width, device->static_info.device_name);
+    else
+      mvwprintw(win, 0, x, "%-*.*s", name_width, name_width, "N/A");
+    x += name_width + 1;
+    // Temperature
+    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, gpu_temp)) {
+      unsigned temp = device->dynamic_info.gpu_temp;
+      unsigned slowdown = GPUINFO_STATIC_FIELD_VALID(&device->static_info, temperature_slowdown_threshold)
+                              ? device->static_info.temperature_slowdown_threshold
+                              : 0;
+      unsigned temp_convert = celsius ? temp : (unsigned)(32 + nearbyint(temp * 1.8));
+      if (slowdown > 0 && temp >= slowdown)
+        wcolor_set(win, red_color, NULL);
+      else if (slowdown > 0 && temp >= slowdown - 5)
+        wcolor_set(win, yellow_color, NULL);
+      else
+        wcolor_set(win, green_color, NULL);
+      mvwprintw(win, 0, x, "%3u", temp_convert);
+      wstandend(win);
+      waddch(win, ACS_DEGREE);
+      waddch(win, celsius ? 'C' : 'F');
+    } else {
+      wcolor_set(win, cyan_color, NULL);
+      mvwprintw(win, 0, x, "  N/A");
+      wstandend(win);
+      waddch(win, ACS_DEGREE);
+      waddch(win, celsius ? 'C' : 'F');
+    }
+    x += 5 + 1;
+    // GPU utilization bar
+    char gpu_text[16];
+    unsigned gpu_percent = 0;
+    if (GPUINFO_DYNAMIC_FIELD_VALID(&device->dynamic_info, gpu_util_rate)) {
+      gpu_percent = device->dynamic_info.gpu_util_rate;
+      snprintf(gpu_text, sizeof(gpu_text), "%3u%%", min(gpu_percent, 100u));
+    } else {
+      snprintf(gpu_text, sizeof(gpu_text), " N/A");
+    }
+    mini_draw_labeled_bar(win, 0, x, 3 + 2 + gpu_text_width + gpu_extra, DEVICE_UNIT_NAME(device), gpu_percent,
+                          gpu_text, green_color);
+    x += 3 + 2 + gpu_text_width + gpu_extra + 1;
+    // Memory usage bar
+    mini_draw_labeled_bar(win, 0, x, 3 + 2 + mem_text_width + mem_extra, "MEM", mem_percent, mem_text,
+                          cyan_color);
+
+    wnoutrefresh(win);
+    ++dev_id;
+  }
 }
 
 static void print_data_at_scale(WINDOW *win, unsigned long long value) {
@@ -2300,6 +2485,12 @@ static void draw_plots(struct list_head *devices, struct nvtop_interface *interf
 
 void draw_gpu_info_ncurses(unsigned devices_count, struct list_head *devices, struct nvtop_interface *interface) {
 
+  if (interface->options.mini_view) {
+    draw_devices_mini(devices, interface);
+    doupdate();
+    return;
+  }
+
   update_extra_info_rows(devices, interface);
   draw_devices(devices, interface);
   if (!interface->setup_win.visible) {
@@ -2354,6 +2545,8 @@ static void option_change_sort(struct nvtop_interface *interface) {
 }
 
 void interface_key(int keyId, struct nvtop_interface *interface) {
+  if (interface->options.mini_view)
+    return; // No interactive elements in the mini view
   if (interface->setup_win.visible) {
     handle_setup_win_keypress(keyId, interface);
     return;
